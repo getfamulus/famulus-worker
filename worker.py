@@ -706,10 +706,33 @@ async def poll_loop(api_base: str, token: str, poll_interval: float) -> None:
         await asyncio.sleep(poll_interval)
 
 
+# ── Scheduler loop ─────────────────────────────────────────────────────────
+
+
+async def scheduler_loop(api_base: str, token: str, interval: float) -> None:
+    """Trigger tasks whose schedule is due by calling the execute endpoint."""
+    log.info("Scheduler polling %s every %.0fs", api_base, interval)
+    triggered: set[str] = set()
+
+    while True:
+        due = _api_get(f"{api_base}/api/scheduler/due", token) or []
+        due_ids = {item["id"] for item in due}
+        triggered &= due_ids
+
+        for task_id in due_ids:
+            if task_id in triggered:
+                continue
+            triggered.add(task_id)
+            log.info("Triggering scheduled task %s", task_id[:8])
+            _api_post(f"{api_base}/api/tasks/{task_id}/execute", token, {})
+
+        await asyncio.sleep(interval)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
-async def main(api_base: str, token: str, poll_interval: float) -> None:
+async def main(api_base: str, token: str, poll_interval: float, scheduler_interval: float) -> None:
     ws_base = api_base.replace("https://", "wss://").replace("http://", "ws://")
     log.info("Worker starting (reverse tunnel mode)")
     log.info("  API:    %s", api_base)
@@ -719,6 +742,7 @@ async def main(api_base: str, token: str, poll_interval: float) -> None:
     await asyncio.gather(
         control_loop(ws_base, token),
         poll_loop(api_base, token, poll_interval),
+        scheduler_loop(api_base, token, scheduler_interval),
     )
 
 
@@ -727,12 +751,13 @@ if __name__ == "__main__":
     parser.add_argument("--api", default="https://taskrunner.dimash.dev", help="Backend API base URL")
     parser.add_argument("--token", default=os.environ.get("TASKRUNNER_TOKEN", ""), help="Auth token")
     parser.add_argument("--poll-interval", type=float, default=3, help="Seconds between polls")
+    parser.add_argument("--scheduler-interval", type=float, default=60, help="Seconds between scheduler checks")
     args = parser.parse_args()
 
     if not args.token:
         parser.error("--token is required (or set TASKRUNNER_TOKEN env var)")
 
     try:
-        asyncio.run(main(args.api, args.token, args.poll_interval))
+        asyncio.run(main(args.api, args.token, args.poll_interval, args.scheduler_interval))
     except KeyboardInterrupt:
         log.info("Worker stopped")
