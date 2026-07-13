@@ -511,18 +511,31 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
     rows = cmd.get("rows", 30)
     shell = os.environ.get("SHELL", "/bin/zsh")
     tmux_session = cmd.get("tmux_session")
-
-    launch = [shell, "-l"]
-    if tmux_session:
-        rc, _, _ = await _tmux("has-session", "-t", tmux_session)
-        if rc == 0:
-            launch = ["tmux", "attach", "-t", tmux_session]
+    await_tmux = bool(cmd.get("await_tmux"))
 
     url = f"{ws_base}/ws/worker/terminal/{sid}?token={urllib.parse.quote(token)}"
-    log.info("Opening terminal session %s (%s)", sid[:8], " ".join(launch))
+    log.info("Opening terminal session %s (tmux=%s await=%s)", sid[:8], tmux_session, await_tmux)
 
     try:
         async with connect(url, max_size=2**20) as ws:
+            # Decide what to run. If a task session is requested, attach to it — waiting
+            # briefly for the worker to spin it up when the task was just started.
+            launch = [shell, "-l"]
+            if tmux_session:
+                deadline = time.monotonic() + (30 if await_tmux else 0)
+                notified = False
+                while True:
+                    rc, _, _ = await _tmux("has-session", "-t", tmux_session)
+                    if rc == 0:
+                        launch = ["tmux", "attach", "-t", tmux_session]
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    if not notified:
+                        await ws.send("\r\n\x1b[90m[waiting for claude session…]\x1b[0m\r\n")
+                        notified = True
+                    await asyncio.sleep(1)
+
             master_fd, slave_fd = pty.openpty()
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)
