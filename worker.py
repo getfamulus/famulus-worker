@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Taskrunner worker — connects to backend via reverse WebSocket tunnel.
 
-Runs claude CLI for pipeline steps and provides live terminal sessions.
-No inbound ports required — all connections are outbound to the backend.
+Runs ONE persistent `claude` session per task inside a detached tmux session,
+feeds each pipeline stage into it (fanning out to subagents for parallel jobs),
+and relays a live terminal to the browser. No inbound ports required — all
+connections are outbound to the backend.
 
 Usage:
     python worker.py --token <TOKEN>
@@ -18,6 +20,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -38,10 +41,12 @@ logging.basicConfig(
 log = logging.getLogger("worker")
 
 CLAUDE_PATH = shutil.which("claude") or "claude"
-STEP_IDLE_TIMEOUT = 600
 STEP_TOTAL_TIMEOUT = 3600
-WORKTREE_SCRIPT = os.path.expanduser("~/.claude/utils/worktree-new.sh")
-CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+SESSION_READY_TIMEOUT = 60
+SESSION_IDLE_GRACE = 90
+CLAUDE_CONFIG = os.path.expanduser("~/.claude.json")
+PANES_DIR = os.path.expanduser("~/.taskrunner/panes")
+RESULTS_FALLBACK = os.path.expanduser("~/.taskrunner/results")
 
 SYSTEM_PROMPT = (
     "You are operating in fully autonomous mode as part of an automated pipeline. "
@@ -71,7 +76,7 @@ async def broadcast_status(event: dict) -> None:
 def _headers(token: str) -> dict[str, str]:
     h: dict[str, str] = {
         "Content-Type": "application/json",
-        "User-Agent": "taskrunner-worker/2.0",
+        "User-Agent": "taskrunner-worker/3.0",
     }
     if token:
         h["Authorization"] = f"Bearer {token}"
@@ -99,295 +104,11 @@ def _api_post(url: str, token: str, payload: dict) -> bool:
         return False
 
 
-# ── Claude CLI ───────────────────────────────────────────────────────────
-
-
-def _fix_session_index(session_id: str, cwd: str) -> None:
-    """Patch the claude session index so the session appears in `claude --resume` from cwd."""
-    if not os.path.isdir(CLAUDE_SESSIONS_DIR):
-        return
-    for fname in os.listdir(CLAUDE_SESSIONS_DIR):
-        if not fname.endswith(".json"):
-            continue
-        path = os.path.join(CLAUDE_SESSIONS_DIR, fname)
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if data.get("sessionId") == session_id and data.get("cwd") != cwd:
-                data["cwd"] = cwd
-                with open(path, "w") as f:
-                    json.dump(data, f)
-                log.debug("Fixed session index cwd for %s", session_id)
-                return
-        except (json.JSONDecodeError, OSError):
-            continue
-
-
-_running_procs: dict[str, asyncio.subprocess.Process] = {}
-
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-
-
-def _build_stream_input(prompt: str, image_paths: list[str]) -> str:
-    """Build a stream-json input message with text and inline images."""
-    import base64
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    for path in image_paths:
-        ext = os.path.splitext(path)[1].lower()
-        media_type = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-        }.get(ext, "image/png")
-        try:
-            with open(path, "rb") as f:
-                data = base64.b64encode(f.read()).decode()
-            content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
-        except OSError:
-            log.warning("Could not read image: %s", path)
-    msg = {"type": "user", "message": {"role": "user", "content": content}}
-    return json.dumps(msg)
-
-
-async def run_claude(
-    prompt: str,
-    session_id: str | None = None,
-    cwd: str | None = None,
-    task_id: str | None = None,
-    step_id: str | None = None,
-    image_paths: list[str] | None = None,
-) -> tuple[bool, str, str | None]:
-    has_images = bool(image_paths)
-    if has_images:
-        args = [
-            CLAUDE_PATH, "-p",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
-            "--system-prompt", SYSTEM_PROMPT,
-        ]
-    else:
-        args = [
-            CLAUDE_PATH, "-p", prompt,
-            "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
-            "--system-prompt", SYSTEM_PROMPT,
-        ]
-    if session_id:
-        args.extend(["--resume", session_id])
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE if has_images else None,
-            cwd=cwd or None,
-        )
-        if has_images:
-            stdin_data = _build_stream_input(prompt, image_paths).encode() + b"\n"
-            proc.stdin.write(stdin_data)
-            proc.stdin.close()
-        if step_id:
-            _running_procs[step_id] = proc
-
-        sid = session_id
-        raw_events: list[dict] = []
-        start_time = time.monotonic()
-        prev_block_count = 0
-
-        async def stream_stdout() -> None:
-            nonlocal sid, prev_block_count
-            while True:
-                if time.monotonic() - start_time > STEP_TOTAL_TIMEOUT:
-                    raise asyncio.TimeoutError()
-                line = await asyncio.wait_for(proc.stdout.readline(), timeout=STEP_IDLE_TIMEOUT)
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").strip()
-                if not text:
-                    continue
-                try:
-                    ev = json.loads(text)
-                    raw_events.append(ev)
-
-                    if ev.get("type") == "system" and ev.get("session_id"):
-                        sid = ev["session_id"]
-                    if ev.get("type") == "result" and ev.get("session_id"):
-                        sid = ev["session_id"]
-
-                    if not (task_id and step_id):
-                        continue
-
-                    if ev.get("type") == "assistant":
-                        blocks = ev.get("message", {}).get("content", [])
-                        new_blocks = blocks[prev_block_count:]
-                        prev_block_count = len(blocks)
-                        if not new_blocks:
-                            continue
-                        delta_ev = {**ev, "message": {"content": new_blocks}}
-                        cleaned_ev = _clean_single_event(delta_ev)
-                    else:
-                        if ev.get("type") != "assistant":
-                            prev_block_count = 0
-                        cleaned_ev = _clean_single_event(ev)
-
-                    if cleaned_ev:
-                        await broadcast_status({
-                            "type": "step_log",
-                            "task_id": task_id,
-                            "step_id": step_id,
-                            "event": cleaned_ev,
-                        })
-                except json.JSONDecodeError:
-                    pass
-
-        try:
-            await stream_stdout()
-        except asyncio.TimeoutError:
-            elapsed = int(time.monotonic() - start_time)
-            log.warning("Claude timed out after %ds", elapsed)
-            proc.kill()
-            return False, f"Timed out after {elapsed}s (idle={STEP_IDLE_TIMEOUT}s, max={STEP_TOTAL_TIMEOUT}s)", sid
-        finally:
-            if step_id:
-                _running_procs.pop(step_id, None)
-
-        await proc.wait()
-        success = proc.returncode == 0
-
-        if sid and cwd:
-            _fix_session_index(sid, cwd)
-
-        if not success and not raw_events:
-            stderr = await proc.stderr.read()
-            return False, stderr.decode("utf-8", errors="replace")[:50_000], sid
-
-        cleaned = _clean_output(json.dumps(raw_events))
-        if len(cleaned) > 50_000:
-            cleaned = _truncate_json_events(cleaned, 50_000)
-        return success, cleaned, sid
-    except FileNotFoundError:
-        return False, f"claude CLI not found (looked at: {CLAUDE_PATH})", None
-
-
-def _clean_output(output: str) -> str:
-    try:
-        data = json.loads(output)
-        if not isinstance(data, list):
-            return output
-        cleaned = []
-        prev_block_count = 0
-        for ev in data:
-            ts = ev.get("timestamp")
-            t = ev.get("type")
-            if t == "system" and ev.get("subtype") == "init":
-                prev_block_count = 0
-                cleaned.append({
-                    "type": "system", "subtype": "init", "timestamp": ts,
-                    "cwd": ev.get("cwd"),
-                    "session_id": ev.get("session_id"),
-                    "model": ev.get("model"),
-                })
-            elif t == "assistant":
-                msg = ev.get("message", {})
-                content = msg.get("content", [])
-                new_blocks = content[prev_block_count:]
-                prev_block_count = len(content)
-                if not new_blocks:
-                    continue
-                slim_content = []
-                for block in new_blocks:
-                    if block.get("type") == "text":
-                        slim_content.append({"type": "text", "text": block.get("text", "")})
-                    elif block.get("type") == "tool_use":
-                        inp = block.get("input", {})
-                        slim_input = {}
-                        for k, v in (inp.items() if isinstance(inp, dict) else []):
-                            sv = str(v)
-                            slim_input[k] = sv[:200] if len(sv) > 200 else v
-                        slim_content.append({"type": "tool_use", "name": block.get("name"), "input": slim_input})
-                    elif block.get("type") == "thinking":
-                        continue
-                if slim_content:
-                    cleaned.append({"type": "assistant", "timestamp": ts, "message": {"content": slim_content}})
-            elif t == "tool_result":
-                prev_block_count = 0
-                content = ev.get("content", "")
-                text = content if isinstance(content, str) else json.dumps(content)
-                if len(text) > 500:
-                    text = text[:500] + "…"
-                cleaned.append({"type": "tool_result", "timestamp": ts, "content": text})
-            elif t == "result":
-                prev_block_count = 0
-                cleaned.append({
-                    "type": "result", "subtype": ev.get("subtype"), "timestamp": ts,
-                    "result": (ev.get("result") or "")[:2000],
-                    "session_id": ev.get("session_id"),
-                    "duration_ms": ev.get("duration_ms"),
-                    "num_turns": ev.get("num_turns"),
-                    "total_cost_usd": ev.get("total_cost_usd"),
-                })
-        return json.dumps(cleaned)
-    except (json.JSONDecodeError, TypeError):
-        return output
-
-
-def _truncate_json_events(output: str, max_len: int) -> str:
-    """Drop middle events until serialised JSON fits in max_len."""
-    try:
-        events = json.loads(output)
-        if not isinstance(events, list) or len(events) <= 2:
-            return output[:max_len]
-        while len(json.dumps(events)) > max_len and len(events) > 2:
-            events.pop(-2)
-        return json.dumps(events)
-    except (json.JSONDecodeError, TypeError):
-        return output[:max_len]
-
-
-def _clean_single_event(ev: dict) -> dict | None:
-    ts = ev.get("timestamp")
-    t = ev.get("type")
-    if t == "system" and ev.get("subtype") == "init":
-        return {"type": "system", "subtype": "init", "timestamp": ts, "cwd": ev.get("cwd"), "session_id": ev.get("session_id"), "model": ev.get("model")}
-    if t == "assistant":
-        msg = ev.get("message", {})
-        content = msg.get("content", [])
-        slim = []
-        for block in content:
-            if block.get("type") == "text":
-                slim.append({"type": "text", "text": block.get("text", "")})
-            elif block.get("type") == "tool_use":
-                inp = block.get("input", {})
-                slim_inp = {k: str(v)[:200] for k, v in (inp.items() if isinstance(inp, dict) else [])}
-                slim.append({"type": "tool_use", "name": block.get("name"), "input": slim_inp})
-        return {"type": "assistant", "timestamp": ts, "message": {"content": slim}} if slim else None
-    if t == "tool_result":
-        content = ev.get("content", "")
-        text = content if isinstance(content, str) else json.dumps(content)
-        return {"type": "tool_result", "timestamp": ts, "content": text[:500]}
-    if t == "result":
-        return {"type": "result", "subtype": ev.get("subtype"), "timestamp": ts, "result": (ev.get("result") or "")[:2000], "session_id": ev.get("session_id"), "duration_ms": ev.get("duration_ms"), "num_turns": ev.get("num_turns"), "total_cost_usd": ev.get("total_cost_usd")}
-    return None
-
-
-def _detect_input_needed(output: str) -> str | None:
-    try:
-        data = json.loads(output)
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and item.get("type") == "result":
-                    result = item.get("result", "")
-                    if result and result.rstrip().endswith("?"):
-                        return result
-        return None
-    except (json.JSONDecodeError, TypeError):
-        if output.rstrip().endswith("?"):
-            return output.strip()
-        return None
+# ── Attachments ──────────────────────────────────────────────────────────
 
 
 ATTACHMENTS_CACHE = os.path.expanduser("~/.taskrunner/attachments")
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 
 def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
@@ -413,101 +134,335 @@ def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
         return None
 
 
-def build_prompt(step: dict, local_paths: list[str] | None = None, has_images: bool = False) -> str:
-    prompt = f"Task: {step['task_title']}\n"
-    if step["task_description"]:
-        prompt += f"Description: {step['task_description']}\n"
-    if local_paths:
-        prompt += "\nAttached files (read with the Read tool):\n"
-        for p in local_paths:
-            prompt += f"  - {p}\n"
-    if has_images:
-        prompt += "\nScreenshots are attached as images in this message.\n"
-    prompt += f"\nStep: {step['step_name']}\n"
-    if step["step_note"]:
-        prompt += f"Instructions: {step['step_note']}\n"
-    return prompt
+# ── tmux + claude session management ─────────────────────────────────────
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\r")
 
 
-# ── Pipeline step processing ─────────────────────────────────────────────
+def _strip(s: str) -> str:
+    return _ANSI.sub("", s)
 
 
-async def process_step(api_base: str, token: str, step: dict) -> None:
-    task_id = step["task_id"]
-    step_id = step["step_id"]
-    step_name = step["step_name"]
-    task_title = step["task_title"]
-    session_id = step.get("session_id")
+def _session_name(task_id: str) -> str:
+    """Deterministic tmux session name shared with the frontend (see TaskDetailPage)."""
+    return "tr-" + task_id.replace("-", "")[:12]
 
-    log.info("Running: %s / %s [%s]", task_title, step_name, step_id[:8])
-    await broadcast_status({"type": "step_started", "task_id": task_id, "step_id": step_id, "step_name": step_name})
 
+async def _tmux(*args: str, inp: str | None = None) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", *args,
+        stdin=asyncio.subprocess.PIPE if inp is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(inp.encode() if inp is not None else None)
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+def _ensure_trust(path: str) -> None:
+    """Pre-accept the workspace trust dialog so interactive claude starts unattended."""
+    try:
+        data = json.load(open(CLAUDE_CONFIG)) if os.path.isfile(CLAUDE_CONFIG) else {}
+    except (json.JSONDecodeError, OSError):
+        return
+    projects = data.setdefault("projects", {})
+    changed = False
+    for p in {path, os.path.realpath(path)}:
+        entry = projects.setdefault(p, {})
+        if not entry.get("hasTrustDialogAccepted") or not entry.get("hasCompletedProjectOnboarding"):
+            entry["hasTrustDialogAccepted"] = True
+            entry["hasCompletedProjectOnboarding"] = True
+            changed = True
+    if changed:
+        try:
+            with open(CLAUDE_CONFIG, "w") as f:
+                json.dump(data, f)
+        except OSError as e:
+            log.warning("Could not persist trust for %s: %s", path, e)
+
+
+def _results_dir(working_dir: str | None, task_id: str) -> str:
+    if working_dir:
+        d = os.path.join(working_dir, ".tr")
+    else:
+        d = os.path.join(RESULTS_FALLBACK, task_id)
+    os.makedirs(d, exist_ok=True)
+    gitignore = os.path.join(d, ".gitignore")
+    if not os.path.isfile(gitignore):
+        try:
+            with open(gitignore, "w") as f:
+                f.write("*\n")
+        except OSError:
+            pass
+    return d
+
+
+# task_id -> {name, results_dir, logfile, stages_sent: set[int], last_active}
+_sessions: dict[str, dict] = {}
+# step_id -> (task_id, monotonic dispatch time) — steps awaiting a result file
+_dispatched: dict[str, tuple[str, float]] = {}
+
+
+async def _wait_ready(logfile: str) -> bool:
+    start = time.monotonic()
+    while time.monotonic() - start < SESSION_READY_TIMEOUT:
+        try:
+            with open(logfile, encoding="utf-8", errors="replace") as f:
+                if "auto mode on" in _strip(f.read()):
+                    return True
+        except OSError:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def _ensure_session(task_id: str, working_dir: str | None) -> dict | None:
+    """Return session state for a task, creating the tmux+claude session if needed."""
+    state = _sessions.get(task_id)
+    name = _session_name(task_id)
+    rc, _, _ = await _tmux("has-session", "-t", name)
+
+    if state and rc == 0:
+        return state
+
+    if rc == 0 and not state:
+        # Worker restarted mid-task: adopt the live session, assume nothing pending yet.
+        state = {
+            "name": name,
+            "results_dir": _results_dir(working_dir, task_id),
+            "logfile": os.path.join(PANES_DIR, f"{name}.log"),
+            "stages_sent": set(),
+            "last_active": time.monotonic(),
+        }
+        _sessions[task_id] = state
+        log.info("Adopted existing session %s after restart", name)
+        return state
+
+    cwd = working_dir or os.path.expanduser("~")
+    _ensure_trust(cwd)
+    os.makedirs(PANES_DIR, exist_ok=True)
+    logfile = os.path.join(PANES_DIR, f"{name}.log")
+    open(logfile, "w").close()
+
+    launch = (
+        f"cd {shlex.quote(cwd)} && exec {shlex.quote(CLAUDE_PATH)} "
+        f"--permission-mode auto --append-system-prompt {shlex.quote(SYSTEM_PROMPT)}"
+    )
+    rc, _, err = await _tmux("new-session", "-d", "-s", name, "-x", "220", "-y", "50", launch)
+    if rc != 0:
+        log.error("Failed to start tmux session %s: %s", name, err)
+        return None
+    await _tmux("pipe-pane", "-o", "-t", name, f"cat >> {shlex.quote(logfile)}")
+
+    state = {
+        "name": name,
+        "results_dir": _results_dir(working_dir, task_id),
+        "logfile": logfile,
+        "stages_sent": set(),
+        "last_active": time.monotonic(),
+    }
+    _sessions[task_id] = state
+    log.info("Started session %s (cwd=%s)", name, cwd)
+
+    if not await _wait_ready(logfile):
+        log.warning("Session %s did not report ready; proceeding anyway", name)
+    return state
+
+
+async def _inject(name: str, text: str) -> None:
+    """Paste a prompt into the claude input box and submit it (handles multi-line safely)."""
+    await _tmux("load-buffer", "-", inp=text)
+    await _tmux("paste-buffer", "-d", "-t", name)
+    await asyncio.sleep(0.5)
+    await _tmux("send-keys", "-t", name, "Enter")
+
+
+async def _kill_session(task_id: str) -> None:
+    state = _sessions.pop(task_id, None)
+    if state:
+        await _tmux("kill-session", "-t", state["name"])
+        log.info("Killed session %s", state["name"])
+
+
+# ── Prompt building ──────────────────────────────────────────────────────
+
+
+def _build_stage_prompt(
+    steps: list[dict],
+    results_dir: str,
+    first_stage: bool,
+    local_paths: list[str],
+) -> str:
+    task_title = steps[0]["task_title"]
+    task_description = steps[0].get("task_description") or ""
+    n = len(steps)
+
+    lines: list[str] = []
+    if first_stage:
+        lines.append("You are running an automated pipeline for the following task. Work fully autonomously.")
+        lines.append("")
+        lines.append(f"TASK: {task_title}")
+        if task_description:
+            lines.append(f"DESCRIPTION: {task_description}")
+        if local_paths:
+            lines.append("")
+            lines.append("Attached files (read with the Read tool):")
+            for p in local_paths:
+                lines.append(f"  - {p}")
+        lines.append("")
+        lines.append(
+            f"This stage has {n} independent job(s). FIRST gather any shared context needed by the jobs "
+            "(e.g. fetch the referenced ticket, read relevant files) EXACTLY ONCE. THEN run the jobs in "
+            "parallel by launching one subagent per job with the Task tool, passing each subagent the shared "
+            "context you already gathered so it does NOT re-fetch anything."
+        )
+    else:
+        lines.append(
+            f"Next stage — {n} job(s). You already have the task context from earlier in this session; do not "
+            "re-fetch it. Do any small shared setup once, then run the jobs in parallel via one subagent each "
+            "with the Task tool."
+        )
+
+    lines.append("")
+    lines.append("Jobs:")
+    for i, step in enumerate(steps, 1):
+        note = step.get("step_note") or ""
+        lines.append(f"  {i}. [step_id={step['step_id']}] {step['step_name']}" + (f" — {note}" if note else ""))
+
+    lines.append("")
+    lines.append(
+        "When each job is finished, record its result with the Write tool to "
+        f"`{results_dir}/<step_id>.json` (one file per job, named by that job's step_id) containing JSON: "
+        '{"status": "passed" or "failed", "output": "<= 2000 char summary of what was done or why it failed"}. '
+        "Write a result file for EVERY job listed above before you finish."
+    )
+    return "\n".join(lines)
+
+
+# ── Pipeline driving ─────────────────────────────────────────────────────
+
+
+async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int, steps: list[dict]) -> None:
+    working_dir = steps[0].get("working_dir")
+    state = await _ensure_session(task_id, working_dir)
+    if not state:
+        for step in steps:
+            _api_post(
+                f"{api_base}/api/tasks/{task_id}/steps/{step['step_id']}/complete",
+                token, {"success": False, "output": "Failed to start claude session"},
+            )
+        return
+
+    if stage_idx in state["stages_sent"]:
+        return
+
+    first_stage = len(state["stages_sent"]) == 0
     local_paths: list[str] = []
-    local_images: list[str] = []
-    for att in step.get("attachments") or []:
-        lp = _download_attachment(api_base, token, att)
-        if lp:
-            ext = os.path.splitext(lp)[1].lower()
-            if ext in IMAGE_EXTS:
-                local_images.append(lp)
-            else:
+    if first_stage:
+        for att in steps[0].get("attachments") or []:
+            lp = _download_attachment(api_base, token, att)
+            if lp:
                 local_paths.append(lp)
 
-    if session_id:
-        prompt = f"Next step: {step_name}"
-        if step.get("step_note"):
-            prompt += f"\nInstructions: {step['step_note']}"
-    else:
-        prompt = build_prompt(step, local_paths or None, has_images=bool(local_images))
+    prompt = _build_stage_prompt(steps, state["results_dir"], first_stage, local_paths)
+    log.info("Dispatching stage %d of task %s (%d job(s))", stage_idx, task_id[:8], len(steps))
+    await _inject(state["name"], prompt)
 
-    working_dir = step.get("working_dir")
-    success, output, sid = await run_claude(prompt, session_id, working_dir, task_id, step_id, local_images or None)
+    state["stages_sent"].add(stage_idx)
+    state["last_active"] = time.monotonic()
+    now = time.monotonic()
+    for step in steps:
+        _dispatched[step["step_id"]] = (task_id, now)
+        await broadcast_status({
+            "type": "step_started",
+            "task_id": task_id,
+            "step_id": step["step_id"],
+            "step_name": step["step_name"],
+        })
 
-    question = _detect_input_needed(output) if success else None
-    if question:
-        log.info("  %s: needs input — %s", step_name, question[:80])
-        _api_post(f"{api_base}/api/tasks/{task_id}/steps/{step_id}/input-needed", token, {"question": question, "session_id": sid})
-        await broadcast_status({"type": "step_input", "task_id": task_id, "step_id": step_id, "question": question[:200]})
-    else:
-        status_str = "passed" if success else "failed"
-        log.info("  %s: %s (%d chars)", step_name, status_str, len(output))
-        _api_post(f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete", token, {"success": success, "output": output, "session_id": sid})
-        await broadcast_status({"type": "step_completed", "task_id": task_id, "step_id": step_id, "status": status_str})
+
+async def collect_results(api_base: str, token: str) -> None:
+    """Post completions for dispatched steps whose result file has appeared (or timed out)."""
+    now = time.monotonic()
+
+    for step_id, (task_id, dispatched_at) in list(_dispatched.items()):
+        state = _sessions.get(task_id)
+        if not state:
+            continue
+
+        result_file = os.path.join(state["results_dir"], f"{step_id}.json")
+        success: bool | None = None
+        output = ""
+
+        if os.path.isfile(result_file):
+            try:
+                data = json.load(open(result_file))
+                success = data.get("status") == "passed"
+                output = str(data.get("output", ""))[:50_000]
+            except (json.JSONDecodeError, OSError):
+                success, output = False, "Invalid result file written by claude"
+            try:
+                os.remove(result_file)
+            except OSError:
+                pass
+        elif now - dispatched_at > STEP_TOTAL_TIMEOUT:
+            success, output = False, f"Timed out after {STEP_TOTAL_TIMEOUT}s with no result"
+
+        if success is None:
+            continue
+
+        _dispatched.pop(step_id, None)
+        state["last_active"] = now
+        _api_post(
+            f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
+            token, {"success": success, "output": output},
+        )
+        await broadcast_status({
+            "type": "step_completed",
+            "task_id": task_id,
+            "step_id": step_id,
+            "status": "passed" if success else "failed",
+        })
+        log.info("  step %s: %s", step_id[:8], "passed" if success else "failed")
+
+
+async def reap_idle_sessions(active_task_ids: set[str]) -> None:
+    now = time.monotonic()
+    for task_id, state in list(_sessions.items()):
+        if task_id in active_task_ids:
+            state["last_active"] = now
+        elif now - state["last_active"] > SESSION_IDLE_GRACE:
+            await _kill_session(task_id)
 
 
 async def process_reply(api_base: str, token: str, reply: dict) -> None:
+    """User replied to a running task — inject the message straight into its live session."""
     task_id = reply["task_id"]
     step_id = reply["step_id"]
-    session_id = reply.get("session_id")
     message = reply["message"]
-
-    log.info("Resuming step %s with reply: %s", step_id[:8], message[:60])
-
-    if not session_id:
-        _api_post(f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete", token, {"success": False, "output": "No session to resume"})
+    state = _sessions.get(task_id)
+    if not state:
+        _api_post(
+            f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
+            token, {"success": False, "output": "No live session to resume"},
+        )
         return
-
-    success, output, sid = await run_claude(message, session_id, task_id=task_id, step_id=step_id)
-    question = _detect_input_needed(output) if success else None
-
-    if question:
-        _api_post(f"{api_base}/api/tasks/{task_id}/steps/{step_id}/input-needed", token, {"question": question, "session_id": sid or session_id})
-        await broadcast_status({"type": "step_input", "task_id": task_id, "step_id": step_id, "question": question[:200]})
-    else:
-        status_str = "passed" if success else "failed"
-        _api_post(f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete", token, {"success": success, "output": output, "session_id": sid or session_id})
-        await broadcast_status({"type": "step_completed", "task_id": task_id, "step_id": step_id, "status": status_str})
+    log.info("Injecting reply into %s: %s", state["name"], message[:60])
+    await _inject(state["name"], message)
+    _dispatched[step_id] = (task_id, time.monotonic())
+    state["last_active"] = time.monotonic()
 
 
 async def create_worktree(api_base: str, token: str, wt: dict) -> None:
     task_id = wt["task_id"]
     ticket_id = wt["ticket_id"]
     repo_path = wt["repo_path"]
+    worktree_script = os.path.expanduser("~/.claude/utils/worktree-new.sh")
 
     log.info("Creating worktree for %s in %s", ticket_id, repo_path)
     try:
         proc = await asyncio.create_subprocess_exec(
-            "bash", WORKTREE_SCRIPT, ticket_id.lower(),
+            "bash", worktree_script, ticket_id.lower(),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=repo_path,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
@@ -545,15 +500,26 @@ def _blocking_read(fd: int) -> bytes:
 
 
 async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
-    """Open a pty and stream it to the backend via a dedicated WebSocket."""
+    """Open a pty and stream it to the backend.
+
+    If a tmux session is requested and live, attach to it (the task's claude session);
+    otherwise fall back to a plain login shell in ``cwd``.
+    """
     sid = cmd["sid"]
     cwd = cmd.get("cwd") or os.path.expanduser("~")
     cols = cmd.get("cols", 120)
     rows = cmd.get("rows", 30)
     shell = os.environ.get("SHELL", "/bin/zsh")
+    tmux_session = cmd.get("tmux_session")
+
+    launch = [shell, "-l"]
+    if tmux_session:
+        rc, _, _ = await _tmux("has-session", "-t", tmux_session)
+        if rc == 0:
+            launch = ["tmux", "attach", "-t", tmux_session]
 
     url = f"{ws_base}/ws/worker/terminal/{sid}?token={urllib.parse.quote(token)}"
-    log.info("Opening terminal session %s (cwd=%s)", sid[:8], cwd)
+    log.info("Opening terminal session %s (%s)", sid[:8], " ".join(launch))
 
     try:
         async with connect(url, max_size=2**20) as ws:
@@ -567,7 +533,7 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
             env["LINES"] = str(rows)
 
             proc = subprocess.Popen(
-                [shell, "-l"],
+                launch,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                 cwd=cwd, env=env, preexec_fn=os.setsid, close_fds=True,
             )
@@ -613,6 +579,7 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
             try:
                 await asyncio.gather(read_pty(), write_pty())
             finally:
+                # Detach cleanly: for a tmux attach this leaves the session (and claude) running.
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
@@ -647,14 +614,8 @@ async def control_loop(ws_base: str, token: str) -> None:
                         asyncio.create_task(handle_terminal_session(ws_base, token, msg))
                     elif msg.get("type") == "stop_task":
                         task_id = msg.get("task_id", "")
-                        killed = 0
-                        for sid, proc in list(_running_procs.items()):
-                            try:
-                                proc.kill()
-                                killed += 1
-                            except ProcessLookupError:
-                                pass
-                        log.info("Stop task %s: killed %d process(es)", task_id[:8], killed)
+                        await _kill_session(task_id)
+                        log.info("Stopped task %s", task_id[:8])
                 except json.JSONDecodeError:
                     pass
         except websockets.ConnectionClosed:
@@ -668,40 +629,37 @@ async def control_loop(ws_base: str, token: str) -> None:
 
 async def poll_loop(api_base: str, token: str, poll_interval: float) -> None:
     log.info("Polling %s every %.0fs", api_base, poll_interval)
-    active: set[str] = set()
 
     while True:
         # Worktrees
         worktrees = _api_get(f"{api_base}/api/tasks/worktrees/pending", token) or []
         for wt in worktrees:
-            if wt["task_id"] not in active:
-                active.add(wt["task_id"])
-                await create_worktree(api_base, token, wt)
-                active.discard(wt["task_id"])
+            await create_worktree(api_base, token, wt)
 
-        # Steps
+        # Steps: group running steps by (task, stage) and drive one stage prompt each.
         steps = _api_get(f"{api_base}/api/tasks/steps/pending", token) or []
-        new_steps = [s for s in steps if s["step_id"] not in active]
-        if new_steps:
-            log.info("Found %d pending step(s)", len(new_steps))
-            for step in new_steps:
-                active.add(step["step_id"])
-            await asyncio.gather(*(process_step(api_base, token, s) for s in new_steps))
-            for step in new_steps:
-                active.discard(step["step_id"])
+        if steps:
+            groups: dict[tuple[str, int], list[dict]] = {}
+            for step in steps:
+                groups.setdefault((step["task_id"], step["stage_idx"]), []).append(step)
+            for (task_id, stage_idx), group in sorted(groups.items(), key=lambda kv: kv[0][1]):
+                already_sent = stage_idx in _sessions.get(task_id, {}).get("stages_sent", set())
+                if not already_sent:
+                    await dispatch_stage(api_base, token, task_id, stage_idx, group)
 
-        # Replies
+        # Replies (steps the user answered — injected straight into the live session)
         replies = _api_get(f"{api_base}/api/tasks/steps/replies", token) or []
-        new_replies = [r for r in replies if r["step_id"] not in active]
-        if new_replies:
-            log.info("Found %d reply(ies)", len(new_replies))
-            for r in new_replies:
-                active.add(r["step_id"])
-            await asyncio.gather(*(process_reply(api_base, token, r) for r in new_replies))
-            for r in new_replies:
-                active.discard(r["step_id"])
+        for reply in replies:
+            if reply["step_id"] not in _dispatched:
+                await process_reply(api_base, token, reply)
 
-        # Heartbeat
+        # Collect finished-job result files and post completions.
+        await collect_results(api_base, token)
+
+        # Keep a session alive while it has running steps OR any dispatched job in flight.
+        active = {s["task_id"] for s in steps} | {tid for tid, _ in _dispatched.values()}
+        await reap_idle_sessions(active)
+
         await broadcast_status({"type": "heartbeat"})
         await asyncio.sleep(poll_interval)
 
