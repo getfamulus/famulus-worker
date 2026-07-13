@@ -47,6 +47,7 @@ SESSION_IDLE_GRACE = 90
 CLAUDE_CONFIG = os.path.expanduser("~/.claude.json")
 PANES_DIR = os.path.expanduser("~/.taskrunner/panes")
 RESULTS_FALLBACK = os.path.expanduser("~/.taskrunner/results")
+STARTED_DIR = os.path.expanduser("~/.taskrunner/started")
 
 SYSTEM_PROMPT = (
     "You are operating in fully autonomous mode as part of an automated pipeline. "
@@ -226,12 +227,13 @@ async def _ensure_session(task_id: str, working_dir: str | None) -> dict | None:
         return state
 
     if rc == 0 and not state:
-        # Worker restarted mid-task: adopt the live session, assume nothing pending yet.
+        # Worker restarted mid-task: adopt the live session; it already has context.
         state = {
             "name": name,
             "results_dir": _results_dir(working_dir, task_id),
             "logfile": os.path.join(PANES_DIR, f"{name}.log"),
             "stages_sent": set(),
+            "fresh": False,
             "last_active": time.monotonic(),
         }
         _sessions[task_id] = state
@@ -241,11 +243,17 @@ async def _ensure_session(task_id: str, working_dir: str | None) -> dict | None:
     cwd = working_dir or os.path.expanduser("~")
     _ensure_trust(cwd)
     os.makedirs(PANES_DIR, exist_ok=True)
+    os.makedirs(STARTED_DIR, exist_ok=True)
     logfile = os.path.join(PANES_DIR, f"{name}.log")
     open(logfile, "w").close()
 
+    # Claude's conversation id is the task id: create it once, resume it on Continue.
+    marker = os.path.join(STARTED_DIR, task_id)
+    resuming = os.path.isfile(marker)
+    session_flag = f"--resume {shlex.quote(task_id)}" if resuming else f"--session-id {shlex.quote(task_id)}"
+
     launch = (
-        f"cd {shlex.quote(cwd)} && exec {shlex.quote(CLAUDE_PATH)} "
+        f"cd {shlex.quote(cwd)} && exec {shlex.quote(CLAUDE_PATH)} {session_flag} "
         f"--permission-mode auto --append-system-prompt {shlex.quote(SYSTEM_PROMPT)}"
     )
     rc, _, err = await _tmux("new-session", "-d", "-s", name, "-x", "220", "-y", "50", launch)
@@ -253,16 +261,22 @@ async def _ensure_session(task_id: str, working_dir: str | None) -> dict | None:
         log.error("Failed to start tmux session %s: %s", name, err)
         return None
     await _tmux("pipe-pane", "-o", "-t", name, f"cat >> {shlex.quote(logfile)}")
+    if not resuming:
+        try:
+            open(marker, "w").close()
+        except OSError:
+            pass
 
     state = {
         "name": name,
         "results_dir": _results_dir(working_dir, task_id),
         "logfile": logfile,
         "stages_sent": set(),
+        "fresh": not resuming,
         "last_active": time.monotonic(),
     }
     _sessions[task_id] = state
-    log.info("Started session %s (cwd=%s)", name, cwd)
+    log.info("Started session %s (cwd=%s, %s)", name, cwd, "resumed" if resuming else "new")
 
     if not await _wait_ready(logfile):
         log.warning("Session %s did not report ready; proceeding anyway", name)
@@ -356,7 +370,9 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
     if stage_idx in state["stages_sent"]:
         return
 
-    first_stage = len(state["stages_sent"]) == 0
+    # Full task context is only injected for a brand-new conversation's first stage.
+    # A resumed session (Continue) already has all prior context.
+    first_stage = state.get("fresh", False) and len(state["stages_sent"]) == 0
     local_paths: list[str] = []
     if first_stage:
         for att in steps[0].get("attachments") or []:
