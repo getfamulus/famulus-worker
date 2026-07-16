@@ -624,8 +624,11 @@ async def create_worktree(api_base: str, token: str, wt: dict) -> None:
             await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-done", token, {"worktree_path": worktree_path})
         else:
             log.error("  Worktree failed (rc=%d): %s", proc.returncode, stderr.decode()[:200])
+            # Report failure so the task fails instead of being re-polled forever.
+            await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-failed", token, {})
     except Exception as e:
         log.error("  Worktree error: %s", e)
+        await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-failed", token, {})
 
 
 # ── Terminal session handler ─────────────────────────────────────────────
