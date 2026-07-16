@@ -504,9 +504,26 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
         })
 
 
+async def _session_alive(name: str, cache: dict[str, bool]) -> bool:
+    """Whether a tmux session is live, memoized within one collect pass.
+
+    Steps of a stage share one session, so this avoids forking an identical
+    ``tmux has-session`` per step every poll.
+
+    :param name: tmux session name
+    :param cache: Per-pass memo of session name -> liveness
+    :return: True if the session exists
+    """
+    if name not in cache:
+        rc, _, _ = await _tmux("has-session", "-t", name)
+        cache[name] = rc == 0
+    return cache[name]
+
+
 async def collect_results(api_base: str, token: str) -> None:
     """Post completions for dispatched steps whose result file has appeared (or timed out)."""
     now = time.monotonic()
+    alive_cache: dict[str, bool] = {}
 
     for step_id, (task_id, dispatched_at) in list(_dispatched.items()):
         state = _sessions.get(task_id)
@@ -531,10 +548,8 @@ async def collect_results(api_base: str, token: str) -> None:
                 pass
         elif now - dispatched_at > STEP_TOTAL_TIMEOUT:
             success, output = False, f"Timed out after {STEP_TOTAL_TIMEOUT}s with no result"
-        else:
-            rc, _, _ = await _tmux("has-session", "-t", state["name"])
-            if rc != 0:
-                success, output = False, "Claude session ended before writing a result"
+        elif not await _session_alive(state["name"], alive_cache):
+            success, output = False, "Claude session ended before writing a result"
 
         if success is None:
             continue
