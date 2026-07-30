@@ -179,6 +179,9 @@ async def _download_attachment_async(api_base: str, token: str, att: dict) -> st
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\r")
 
+# Pane markers meaning claude will never produce a result without human action.
+_BLOCKED_RE = re.compile(r"Login expired|Please run /login|Invalid API key", re.IGNORECASE)
+
 
 def _strip(s: str) -> str:
     return _ANSI.sub("", s)
@@ -520,10 +523,35 @@ async def _session_alive(name: str, cache: dict[str, bool]) -> bool:
     return cache[name]
 
 
+async def _session_blocked(name: str, cache: dict[str, str | None]) -> str | None:
+    """Return why a live session can't make progress, if it's stuck on something.
+
+    Claude sitting at an expired login accepts the prompt and then does nothing,
+    so without this the step would wait out STEP_TOTAL_TIMEOUT with no clue why.
+
+    :param name: tmux session name
+    :param cache: Per-pass memo of session name -> reason (or None)
+    :return: A human-readable reason, or None when nothing is obviously wrong
+    """
+    if name not in cache:
+        reason: str | None = None
+        rc, out, _ = await _tmux("capture-pane", "-p", "-t", name)
+        if rc == 0:
+            match = _BLOCKED_RE.search(" ".join(_strip(out).split()))
+            if match:
+                reason = (
+                    f"claude cannot run: {match.group(0)}. "
+                    "Start claude on the worker machine and sign in, then re-run."
+                )
+        cache[name] = reason
+    return cache[name]
+
+
 async def collect_results(api_base: str, token: str) -> None:
     """Post completions for dispatched steps whose result file has appeared (or timed out)."""
     now = time.monotonic()
     alive_cache: dict[str, bool] = {}
+    blocked_cache: dict[str, str | None] = {}
 
     for step_id, (task_id, dispatched_at) in list(_dispatched.items()):
         state = _sessions.get(task_id)
@@ -550,6 +578,10 @@ async def collect_results(api_base: str, token: str) -> None:
             success, output = False, f"Timed out after {STEP_TOTAL_TIMEOUT}s with no result"
         elif not await _session_alive(state["name"], alive_cache):
             success, output = False, "Claude session ended before writing a result"
+        else:
+            blocked = await _session_blocked(state["name"], blocked_cache)
+            if blocked:
+                success, output = False, blocked
 
         if success is None:
             continue
