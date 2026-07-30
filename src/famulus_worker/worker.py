@@ -665,6 +665,18 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
     try:
         async with connect(url, max_size=2**20) as ws:
             await ws.send(json.dumps({"type": "auth", "token": token}))
+
+            # A task's working dir can disappear after the fact (a cleaned-up
+            # worktree, for instance). Fall back to home and say so, rather than
+            # failing to spawn with the reason only visible in the worker log.
+            if not os.path.isdir(cwd):
+                fallback = os.path.expanduser("~")
+                await ws.send(
+                    f"\r\n\x1b[33m[{cwd} no longer exists; opening {fallback} instead]\x1b[0m\r\n"
+                )
+                log.warning("Terminal cwd %s missing; falling back to %s", cwd, fallback)
+                cwd = fallback
+
             # Decide what to run. If a task session is requested, attach to it — waiting
             # briefly for the worker to spin it up when the task was just started.
             launch = [shell, "-l"]
@@ -692,11 +704,19 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
             env["COLUMNS"] = str(cols)
             env["LINES"] = str(rows)
 
-            proc = subprocess.Popen(
-                launch,
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                cwd=cwd, env=env, preexec_fn=os.setsid, close_fds=True,
-            )
+            try:
+                proc = subprocess.Popen(
+                    launch,
+                    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                    cwd=cwd, env=env, preexec_fn=os.setsid, close_fds=True,
+                )
+            except OSError as e:
+                # Report the reason in the terminal instead of closing silently.
+                await ws.send(f"\r\n\x1b[31m[could not start {launch[0]}: {e}]\x1b[0m\r\n")
+                log.error("Terminal session %s could not spawn %s: %s", sid[:8], launch[0], e)
+                os.close(slave_fd)
+                os.close(master_fd)
+                return
             os.close(slave_fd)
 
             flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
