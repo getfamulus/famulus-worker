@@ -27,8 +27,8 @@ import struct
 import subprocess
 import termios
 import time
-import urllib.parse
 import urllib.request
+from collections.abc import Awaitable, Callable
 
 import websockets
 from websockets.asyncio.client import connect
@@ -48,6 +48,7 @@ CLAUDE_CONFIG = os.path.expanduser("~/.claude.json")
 PANES_DIR = os.path.expanduser("~/.taskrunner/panes")
 RESULTS_FALLBACK = os.path.expanduser("~/.taskrunner/results")
 STARTED_DIR = os.path.expanduser("~/.taskrunner/started")
+DISPATCHED_DIR = os.path.expanduser("~/.taskrunner/dispatched")
 
 SYSTEM_PROMPT = (
     "You are operating in fully autonomous mode as part of an automated pipeline. "
@@ -105,11 +106,31 @@ def _api_post(url: str, token: str, payload: dict) -> bool:
         return False
 
 
+async def _api_get_async(url: str, token: str) -> list | dict | None:
+    """Run the blocking GET off the event loop.
+
+    :param url: Fully qualified endpoint URL
+    :param token: Bearer token for the Authorization header
+    :return: Decoded JSON body, or None on failure
+    """
+    return await asyncio.to_thread(_api_get, url, token)
+
+
+async def _api_post_async(url: str, token: str, payload: dict) -> bool:
+    """Run the blocking POST off the event loop.
+
+    :param url: Fully qualified endpoint URL
+    :param token: Bearer token for the Authorization header
+    :param payload: JSON-serialisable request body
+    :return: True on HTTP 200, else False
+    """
+    return await asyncio.to_thread(_api_post, url, token, payload)
+
+
 # ── Attachments ──────────────────────────────────────────────────────────
 
 
 ATTACHMENTS_CACHE = os.path.expanduser("~/.taskrunner/attachments")
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 
 def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
@@ -117,12 +138,20 @@ def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
     m = re.search(r"attachments/([^/]+)/(.+)$", path)
     if not m:
         return None
-    file_id, filename = m.group(1), m.group(2)
-    local_dir = os.path.join(ATTACHMENTS_CACHE, file_id)
+    file_id, raw_filename = m.group(1), m.group(2)
+    filename = os.path.basename(raw_filename)
+    if not filename or filename in {".", ".."}:
+        log.error("Rejected attachment with unsafe filename: %r", raw_filename)
+        return None
+    local_dir = os.path.join(ATTACHMENTS_CACHE, os.path.basename(file_id))
     local_path = os.path.join(local_dir, filename)
+    real_dir = os.path.realpath(local_dir)
+    if not os.path.realpath(local_path).startswith(real_dir + os.sep):
+        log.error("Rejected attachment escaping cache dir: %r", raw_filename)
+        return None
     if os.path.isfile(local_path):
         return local_path
-    url = f"{api_base}/api/tasks/attachments/{file_id}/{filename}"
+    url = f"{api_base}/api/tasks/attachments/{file_id}/{raw_filename}"
     try:
         req = urllib.request.Request(url, headers=_headers(token))
         os.makedirs(local_dir, exist_ok=True)
@@ -133,6 +162,17 @@ def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
     except Exception as e:
         log.error("Failed to download attachment %s: %s", filename, e)
         return None
+
+
+async def _download_attachment_async(api_base: str, token: str, att: dict) -> str | None:
+    """Run the blocking attachment download off the event loop.
+
+    :param api_base: Backend API base URL
+    :param token: Bearer token for the Authorization header
+    :param att: Attachment descriptor containing its storage path
+    :return: Local cached path, or None on failure
+    """
+    return await asyncio.to_thread(_download_attachment, api_base, token, att)
 
 
 # ── tmux + claude session management ─────────────────────────────────────
@@ -163,7 +203,11 @@ async def _tmux(*args: str, inp: str | None = None) -> tuple[int, str, str]:
 def _ensure_trust(path: str) -> None:
     """Pre-accept the workspace trust dialog so interactive claude starts unattended."""
     try:
-        data = json.load(open(CLAUDE_CONFIG)) if os.path.isfile(CLAUDE_CONFIG) else {}
+        if os.path.isfile(CLAUDE_CONFIG):
+            with open(CLAUDE_CONFIG) as f:
+                data = json.load(f)
+        else:
+            data = {}
     except (json.JSONDecodeError, OSError):
         return
     projects = data.setdefault("projects", {})
@@ -184,17 +228,19 @@ def _ensure_trust(path: str) -> None:
 
 def _results_dir(working_dir: str | None, task_id: str) -> str:
     if working_dir:
-        d = os.path.join(working_dir, ".tr")
+        base = os.path.join(working_dir, ".tr")
+        os.makedirs(base, exist_ok=True)
+        gitignore = os.path.join(base, ".gitignore")
+        if not os.path.isfile(gitignore):
+            try:
+                with open(gitignore, "w") as f:
+                    f.write("*\n")
+            except OSError:
+                pass
+        d = os.path.join(base, task_id)
     else:
         d = os.path.join(RESULTS_FALLBACK, task_id)
     os.makedirs(d, exist_ok=True)
-    gitignore = os.path.join(d, ".gitignore")
-    if not os.path.isfile(gitignore):
-        try:
-            with open(gitignore, "w") as f:
-                f.write("*\n")
-        except OSError:
-            pass
     return d
 
 
@@ -202,6 +248,50 @@ def _results_dir(working_dir: str | None, task_id: str) -> str:
 _sessions: dict[str, dict] = {}
 # step_id -> (task_id, monotonic dispatch time) — steps awaiting a result file
 _dispatched: dict[str, tuple[str, float]] = {}
+
+
+def _dispatch_marker(task_id: str, stage_idx: int) -> str:
+    return os.path.join(DISPATCHED_DIR, f"{task_id}.{stage_idx}")
+
+
+def _is_stage_dispatched(task_id: str, stage_idx: int) -> bool:
+    """Return whether a stage was already injected in a prior (pre-restart) run.
+
+    :param task_id: Owning task id
+    :param stage_idx: Pipeline stage index
+    :return: True if a persisted dispatch marker exists
+    """
+    return os.path.isfile(_dispatch_marker(task_id, stage_idx))
+
+
+def _mark_stage_dispatched(task_id: str, stage_idx: int) -> None:
+    """Persist a marker so a restart does not re-inject an in-flight stage.
+
+    :param task_id: Owning task id
+    :param stage_idx: Pipeline stage index
+    """
+    try:
+        os.makedirs(DISPATCHED_DIR, exist_ok=True)
+        open(_dispatch_marker(task_id, stage_idx), "w").close()
+    except OSError as e:
+        log.warning("Could not persist dispatch marker for %s.%d: %s", task_id[:8], stage_idx, e)
+
+
+def _clear_dispatch_markers(task_id: str) -> None:
+    """Remove all persisted dispatch markers for a task.
+
+    :param task_id: Owning task id
+    """
+    try:
+        entries = os.listdir(DISPATCHED_DIR)
+    except OSError:
+        return
+    for entry in entries:
+        if entry == task_id or entry.startswith(f"{task_id}."):
+            try:
+                os.remove(os.path.join(DISPATCHED_DIR, entry))
+            except OSError:
+                pass
 
 
 async def _wait_ready(logfile: str) -> bool:
@@ -296,6 +386,11 @@ async def _kill_session(task_id: str) -> None:
     if state:
         await _tmux("kill-session", "-t", state["name"])
         log.info("Killed session %s", state["name"])
+    _clear_dispatch_markers(task_id)
+    try:
+        os.remove(os.path.join(STARTED_DIR, task_id))
+    except OSError:
+        pass
 
 
 # ── Prompt building ──────────────────────────────────────────────────────
@@ -361,7 +456,7 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
     state = await _ensure_session(task_id, working_dir)
     if not state:
         for step in steps:
-            _api_post(
+            await _api_post_async(
                 f"{api_base}/api/tasks/{task_id}/steps/{step['step_id']}/complete",
                 token, {"success": False, "output": "Failed to start claude session"},
             )
@@ -370,13 +465,24 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
     if stage_idx in state["stages_sent"]:
         return
 
+    # After a restart the live tmux session is adopted with an empty stages_sent set.
+    # A persisted marker means this stage was already injected before the restart, so
+    # re-injecting would duplicate the work — adopt its in-flight steps instead.
+    if _is_stage_dispatched(task_id, stage_idx):
+        state["stages_sent"].add(stage_idx)
+        now = time.monotonic()
+        for step in steps:
+            _dispatched[step["step_id"]] = (task_id, now)
+        log.info("Stage %d of task %s already dispatched; adopting in-flight steps", stage_idx, task_id[:8])
+        return
+
     # Full task context is only injected for a brand-new conversation's first stage.
     # A resumed session (Continue) already has all prior context.
     first_stage = state.get("fresh", False) and len(state["stages_sent"]) == 0
     local_paths: list[str] = []
     if first_stage:
         for att in steps[0].get("attachments") or []:
-            lp = _download_attachment(api_base, token, att)
+            lp = await _download_attachment_async(api_base, token, att)
             if lp:
                 local_paths.append(lp)
 
@@ -385,6 +491,7 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
     await _inject(state["name"], prompt)
 
     state["stages_sent"].add(stage_idx)
+    _mark_stage_dispatched(task_id, stage_idx)
     state["last_active"] = time.monotonic()
     now = time.monotonic()
     for step in steps:
@@ -397,9 +504,26 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
         })
 
 
+async def _session_alive(name: str, cache: dict[str, bool]) -> bool:
+    """Whether a tmux session is live, memoized within one collect pass.
+
+    Steps of a stage share one session, so this avoids forking an identical
+    ``tmux has-session`` per step every poll.
+
+    :param name: tmux session name
+    :param cache: Per-pass memo of session name -> liveness
+    :return: True if the session exists
+    """
+    if name not in cache:
+        rc, _, _ = await _tmux("has-session", "-t", name)
+        cache[name] = rc == 0
+    return cache[name]
+
+
 async def collect_results(api_base: str, token: str) -> None:
     """Post completions for dispatched steps whose result file has appeared (or timed out)."""
     now = time.monotonic()
+    alive_cache: dict[str, bool] = {}
 
     for step_id, (task_id, dispatched_at) in list(_dispatched.items()):
         state = _sessions.get(task_id)
@@ -412,7 +536,8 @@ async def collect_results(api_base: str, token: str) -> None:
 
         if os.path.isfile(result_file):
             try:
-                data = json.load(open(result_file))
+                with open(result_file) as f:
+                    data = json.load(f)
                 success = data.get("status") == "passed"
                 output = str(data.get("output", ""))[:50_000]
             except (json.JSONDecodeError, OSError):
@@ -423,13 +548,15 @@ async def collect_results(api_base: str, token: str) -> None:
                 pass
         elif now - dispatched_at > STEP_TOTAL_TIMEOUT:
             success, output = False, f"Timed out after {STEP_TOTAL_TIMEOUT}s with no result"
+        elif not await _session_alive(state["name"], alive_cache):
+            success, output = False, "Claude session ended before writing a result"
 
         if success is None:
             continue
 
         _dispatched.pop(step_id, None)
         state["last_active"] = now
-        _api_post(
+        await _api_post_async(
             f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
             token, {"success": success, "output": output},
         )
@@ -458,7 +585,7 @@ async def process_reply(api_base: str, token: str, reply: dict) -> None:
     message = reply["message"]
     state = _sessions.get(task_id)
     if not state:
-        _api_post(
+        await _api_post_async(
             f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
             token, {"success": False, "output": "No live session to resume"},
         )
@@ -494,11 +621,14 @@ async def create_worktree(api_base: str, token: str, wt: dict) -> None:
 
         if proc.returncode == 0 and worktree_path:
             log.info("  Worktree created: %s", worktree_path)
-            _api_post(f"{api_base}/api/tasks/{task_id}/worktree-done", token, {"worktree_path": worktree_path})
+            await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-done", token, {"worktree_path": worktree_path})
         else:
             log.error("  Worktree failed (rc=%d): %s", proc.returncode, stderr.decode()[:200])
+            # Report failure so the task fails instead of being re-polled forever.
+            await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-failed", token, {})
     except Exception as e:
         log.error("  Worktree error: %s", e)
+        await _api_post_async(f"{api_base}/api/tasks/{task_id}/worktree-failed", token, {})
 
 
 # ── Terminal session handler ─────────────────────────────────────────────
@@ -529,11 +659,12 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
     tmux_session = cmd.get("tmux_session")
     await_tmux = bool(cmd.get("await_tmux"))
 
-    url = f"{ws_base}/ws/worker/terminal/{sid}?token={urllib.parse.quote(token)}"
+    url = f"{ws_base}/ws/worker/terminal/{sid}"
     log.info("Opening terminal session %s (tmux=%s await=%s)", sid[:8], tmux_session, await_tmux)
 
     try:
         async with connect(url, max_size=2**20) as ws:
+            await ws.send(json.dumps({"type": "auth", "token": token}))
             # Decide what to run. If a task session is requested, attach to it — waiting
             # briefly for the worker to spin it up when the task was just started.
             launch = [shell, "-l"]
@@ -628,11 +759,16 @@ async def handle_terminal_session(ws_base: str, token: str, cmd: dict) -> None:
 
 async def control_loop(ws_base: str, token: str) -> None:
     """Persistent outbound WebSocket to the backend relay."""
-    url = f"{ws_base}/ws/worker?token={urllib.parse.quote(token)}"
+    url = f"{ws_base}/ws/worker"
     log.info("Connecting to backend: %s", ws_base)
 
     async for ws in connect(url, ping_interval=30, ping_timeout=10, max_size=2**20):
         global _control_ws
+        try:
+            await ws.send(json.dumps({"type": "auth", "token": token}))
+        except websockets.ConnectionClosed:
+            log.warning("Backend closed during auth, reconnecting...")
+            continue
         _control_ws = ws
         log.info("Connected to backend relay")
         try:
@@ -660,40 +796,61 @@ async def poll_loop(api_base: str, token: str, poll_interval: float) -> None:
     log.info("Polling %s every %.0fs", api_base, poll_interval)
 
     while True:
-        # Worktrees
-        worktrees = _api_get(f"{api_base}/api/tasks/worktrees/pending", token) or []
-        for wt in worktrees:
-            await create_worktree(api_base, token, wt)
+        try:
+            # Worktrees
+            worktrees = await _api_get_async(f"{api_base}/api/tasks/worktrees/pending", token) or []
+            for wt in worktrees:
+                await create_worktree(api_base, token, wt)
 
-        # Steps: group running steps by (task, stage) and drive one stage prompt each.
-        steps = _api_get(f"{api_base}/api/tasks/steps/pending", token) or []
-        if steps:
-            groups: dict[tuple[str, int], list[dict]] = {}
-            for step in steps:
-                groups.setdefault((step["task_id"], step["stage_idx"]), []).append(step)
-            for (task_id, stage_idx), group in sorted(groups.items(), key=lambda kv: kv[0][1]):
-                already_sent = stage_idx in _sessions.get(task_id, {}).get("stages_sent", set())
-                if not already_sent:
-                    await dispatch_stage(api_base, token, task_id, stage_idx, group)
+            # Steps: group running steps by (task, stage) and drive one stage prompt each.
+            steps = await _api_get_async(f"{api_base}/api/tasks/steps/pending", token) or []
+            if steps:
+                groups: dict[tuple[str, int], list[dict]] = {}
+                for step in steps:
+                    groups.setdefault((step["task_id"], step["stage_idx"]), []).append(step)
+                for (task_id, stage_idx), group in sorted(groups.items(), key=lambda kv: kv[0][1]):
+                    already_sent = stage_idx in _sessions.get(task_id, {}).get("stages_sent", set())
+                    if not already_sent:
+                        await dispatch_stage(api_base, token, task_id, stage_idx, group)
 
-        # Replies (steps the user answered — injected straight into the live session)
-        replies = _api_get(f"{api_base}/api/tasks/steps/replies", token) or []
-        for reply in replies:
-            if reply["step_id"] not in _dispatched:
-                await process_reply(api_base, token, reply)
+            # Replies (steps the user answered — injected straight into the live session)
+            replies = await _api_get_async(f"{api_base}/api/tasks/steps/replies", token) or []
+            for reply in replies:
+                if reply["step_id"] not in _dispatched:
+                    await process_reply(api_base, token, reply)
 
-        # Collect finished-job result files and post completions.
-        await collect_results(api_base, token)
+            # Collect finished-job result files and post completions.
+            await collect_results(api_base, token)
 
-        # Keep a session alive while it has running steps OR any dispatched job in flight.
-        active = {s["task_id"] for s in steps} | {tid for tid, _ in _dispatched.values()}
-        await reap_idle_sessions(active)
+            # Keep a session alive while it has running steps OR any dispatched job in flight.
+            active = {s["task_id"] for s in steps} | {tid for tid, _ in _dispatched.values()}
+            await reap_idle_sessions(active)
 
-        await broadcast_status({"type": "heartbeat"})
+            await broadcast_status({"type": "heartbeat"})
+        except Exception:
+            log.exception("poll_loop iteration failed; continuing")
+
         await asyncio.sleep(poll_interval)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
+
+
+async def _supervise(name: str, factory: Callable[[], Awaitable[None]]) -> None:
+    """Restart a long-running coroutine whenever it crashes.
+
+    :param name: Human-readable coroutine name for logging
+    :param factory: Zero-arg callable returning a fresh awaitable to run
+    """
+    while True:
+        try:
+            await factory()
+            log.warning("%s exited cleanly; restarting in 3s", name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("%s crashed; restarting in 3s", name)
+        await asyncio.sleep(3)
 
 
 async def main(api_base: str, token: str, poll_interval: float) -> None:
@@ -704,8 +861,8 @@ async def main(api_base: str, token: str, poll_interval: float) -> None:
     log.info("  Claude: %s", CLAUDE_PATH)
 
     await asyncio.gather(
-        control_loop(ws_base, token),
-        poll_loop(api_base, token, poll_interval),
+        _supervise("control_loop", lambda: control_loop(ws_base, token)),
+        _supervise("poll_loop", lambda: poll_loop(api_base, token, poll_interval)),
     )
 
 
@@ -713,13 +870,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Taskrunner worker (reverse tunnel)")
     parser.add_argument("--api", default="https://taskrunner.dimash.dev", help="Backend API base URL")
     parser.add_argument("--token", default=os.environ.get("TASKRUNNER_TOKEN", ""), help="Auth token")
+    parser.add_argument(
+        "--worker-token",
+        default=os.environ.get("TASKRUNNER_WORKER_TOKEN", ""),
+        help="Worker token for WS auth and REST (falls back to --token/TASKRUNNER_TOKEN)",
+    )
     parser.add_argument("--poll-interval", type=float, default=3, help="Seconds between polls")
     args = parser.parse_args()
 
-    if not args.token:
-        parser.error("--token is required (or set TASKRUNNER_TOKEN env var)")
+    token = args.worker_token or args.token
+    if not token:
+        parser.error(
+            "a token is required: set --worker-token/TASKRUNNER_WORKER_TOKEN "
+            "or --token/TASKRUNNER_TOKEN"
+        )
 
     try:
-        asyncio.run(main(args.api, args.token, args.poll_interval))
+        asyncio.run(main(args.api, token, args.poll_interval))
     except KeyboardInterrupt:
         log.info("Worker stopped")
