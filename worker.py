@@ -45,10 +45,10 @@ STEP_TOTAL_TIMEOUT = 3600
 SESSION_READY_TIMEOUT = 60
 SESSION_IDLE_GRACE = 90
 CLAUDE_CONFIG = os.path.expanduser("~/.claude.json")
-PANES_DIR = os.path.expanduser("~/.taskrunner/panes")
-RESULTS_FALLBACK = os.path.expanduser("~/.taskrunner/results")
-STARTED_DIR = os.path.expanduser("~/.taskrunner/started")
-DISPATCHED_DIR = os.path.expanduser("~/.taskrunner/dispatched")
+PANES_DIR = os.path.expanduser("~/.famulus/panes")
+RESULTS_FALLBACK = os.path.expanduser("~/.famulus/results")
+STARTED_DIR = os.path.expanduser("~/.famulus/started")
+DISPATCHED_DIR = os.path.expanduser("~/.famulus/dispatched")
 
 SYSTEM_PROMPT = (
     "You are operating in fully autonomous mode as part of an automated pipeline. "
@@ -78,7 +78,7 @@ async def broadcast_status(event: dict) -> None:
 def _headers(token: str) -> dict[str, str]:
     h: dict[str, str] = {
         "Content-Type": "application/json",
-        "User-Agent": "taskrunner-worker/3.0",
+        "User-Agent": "famulus-worker/1.0",
     }
     if token:
         h["Authorization"] = f"Bearer {token}"
@@ -130,7 +130,7 @@ async def _api_post_async(url: str, token: str, payload: dict) -> bool:
 # ── Attachments ──────────────────────────────────────────────────────────
 
 
-ATTACHMENTS_CACHE = os.path.expanduser("~/.taskrunner/attachments")
+ATTACHMENTS_CACHE = os.path.expanduser("~/.famulus/attachments")
 
 
 def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
@@ -868,12 +868,12 @@ async def main(api_base: str, token: str, poll_interval: float) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Taskrunner worker (reverse tunnel)")
-    parser.add_argument("--api", default="https://taskrunner.dimash.dev", help="Backend API base URL")
-    parser.add_argument("--token", default=os.environ.get("TASKRUNNER_TOKEN", ""), help="Auth token")
+    parser.add_argument("--api", default="http://localhost:8000", help="Backend API base URL")
+    parser.add_argument("--token", default=os.environ.get("FAMULUS_TOKEN", ""), help="Auth token")
     parser.add_argument(
         "--worker-token",
-        default=os.environ.get("TASKRUNNER_WORKER_TOKEN", ""),
-        help="Worker token for WS auth and REST (falls back to --token/TASKRUNNER_TOKEN)",
+        default=os.environ.get("FAMULUS_WORKER_TOKEN", ""),
+        help="Worker token for WS auth and REST (falls back to --token/FAMULUS_TOKEN)",
     )
     parser.add_argument("--poll-interval", type=float, default=3, help="Seconds between polls")
     args = parser.parse_args()
@@ -881,8 +881,8 @@ if __name__ == "__main__":
     token = args.worker_token or args.token
     if not token:
         parser.error(
-            "a token is required: set --worker-token/TASKRUNNER_WORKER_TOKEN "
-            "or --token/TASKRUNNER_TOKEN"
+            "a token is required: set --worker-token/FAMULUS_WORKER_TOKEN "
+            "or --token/FAMULUS_TOKEN"
         )
 
     try:
