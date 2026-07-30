@@ -145,6 +145,7 @@ implementation in [`examples/worktree-new.sh`](examples/worktree-new.sh).
 | Symptom | Cause |
 |---|---|
 | `Backend closed during auth, reconnecting…` | Token mismatch. It must equal the backend's `FAMULUS_WORKER_TOKEN` |
+| `claude cannot run: Login expired` | The CLI's login lapsed. Run `claude` on this machine, sign in, then re-run the task |
 | `Session … did not report ready` | `claude` was slow or isn't signed in. Run `claude` once by hand |
 | Steps stay "running" forever | No `tmux`, or Claude never wrote a result file. Open the live terminal to look |
 | `Worktree failed` | Your `worktree-new.sh` is missing or didn't print `WORKTREE_PATH=` |
