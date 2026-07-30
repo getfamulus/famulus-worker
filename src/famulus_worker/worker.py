@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Taskrunner worker — connects to backend via reverse WebSocket tunnel.
+"""Famulus worker — connects to backend via reverse WebSocket tunnel.
 
 Runs ONE persistent `claude` session per task inside a detached tmux session,
 feeds each pipeline stage into it (fanning out to subagents for parallel jobs),
@@ -866,9 +866,14 @@ async def main(api_base: str, token: str, poll_interval: float) -> None:
     )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Taskrunner worker (reverse tunnel)")
-    parser.add_argument("--api", default="http://localhost:8000", help="Backend API base URL")
+def main_cli() -> None:
+    """Console-script entry point: parse arguments and run the worker."""
+    parser = argparse.ArgumentParser(
+        prog="famulus-worker",
+        description="Famulus worker — runs Claude Code sessions locally and reports to the backend.",
+    )
+    parser.add_argument("--api", default=os.environ.get("FAMULUS_API", "http://localhost:8000"),
+                        help="Backend API base URL (env: FAMULUS_API)")
     parser.add_argument("--token", default=os.environ.get("FAMULUS_TOKEN", ""), help="Auth token")
     parser.add_argument(
         "--worker-token",
@@ -889,3 +894,7 @@ if __name__ == "__main__":
         asyncio.run(main(args.api, token, args.poll_interval))
     except KeyboardInterrupt:
         log.info("Worker stopped")
+
+
+if __name__ == "__main__":
+    main_cli()
