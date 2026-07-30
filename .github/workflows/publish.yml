@@ -1,0 +1,55 @@
+name: Publish
+
+# Publishes famulus-worker to PyPI when a version tag is pushed.
+#
+# Uses PyPI Trusted Publishing (OIDC), so there is no API token to store or
+# rotate. Configure it once at https://pypi.org/manage/account/publishing/ with:
+#   owner: getfamulus   repository: famulus-worker
+#   workflow: publish.yml   environment: pypi
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Check the tag matches the packaged version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $pkg"
+            exit 1
+          fi
+          echo "version $pkg"
+
+      - name: Build
+        run: uv build
+
+      - name: Check the entry point works from the built wheel
+        run: uv run --with dist/*.whl --no-project famulus-worker --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
