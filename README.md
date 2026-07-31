@@ -34,7 +34,7 @@ practice that means:
   relayed to whoever is authenticated to the web UI.
 
 Run it against directories you're willing to let an agent modify, with a backend only
-you can reach. See [SECURITY.md](SECURITY.md) for the full trust model.
+you can reach. See [SECURITY.md](https://github.com/getfamulus/famulus-worker/blob/main/SECURITY.md) for the full trust model.
 
 ---
 
@@ -138,7 +138,7 @@ Those markers are what make a restart adopt in-flight work instead of re-running
 If a task asks for a git worktree, the worker runs
 `~/.claude/utils/worktree-new.sh <ticket-id>` in the repository and expects it to print
 `WORKTREE_PATH=<path>`. Supply your own script at that path. There's a reference
-implementation in [`examples/worktree-new.sh`](examples/worktree-new.sh).
+implementation in [`examples/worktree-new.sh`](https://github.com/getfamulus/famulus-worker/blob/main/examples/worktree-new.sh).
 
 ## Troubleshooting
 
@@ -160,4 +160,4 @@ uv build
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/getfamulus/famulus-worker/blob/main/LICENSE).
