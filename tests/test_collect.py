@@ -18,6 +18,7 @@ def isolate(monkeypatch):
     """Give each test its own dispatch/session state and no real network."""
     monkeypatch.setattr(worker, "_sessions", {})
     monkeypatch.setattr(worker, "_dispatched", {})
+    monkeypatch.setattr(worker, "_run_tokens", {})
     posted: list[tuple[str, dict]] = []
     events: list[dict] = []
 
@@ -33,7 +34,7 @@ def isolate(monkeypatch):
     return {"posted": posted, "events": events}
 
 
-def dispatch(tmp_path, step_id="s1", task_id="t1", age=0.0):
+def dispatch(tmp_path, step_id="s1", task_id="t1", age=0.0, run_token="tok-1"):
     worker._sessions[task_id] = {
         "name": "tr-abc",
         "results_dir": str(tmp_path),
@@ -42,6 +43,7 @@ def dispatch(tmp_path, step_id="s1", task_id="t1", age=0.0):
         "last_active": time.monotonic(),
     }
     worker._dispatched[step_id] = (task_id, time.monotonic() - age)
+    worker._run_tokens[step_id] = run_token
 
 
 def alive(monkeypatch, is_alive=True, blocked=None):
@@ -99,7 +101,7 @@ class TestCollectResults:
         assert len(isolate["posted"]) == 1
         url, payload = isolate["posted"][0]
         assert url.endswith("/api/tasks/t1/steps/s1/complete")
-        assert payload == {"success": True, "output": "done"}
+        assert payload == {"success": True, "output": "done", "run_token": "tok-1"}
         assert isolate["events"][0]["status"] == "passed"
 
     async def test_posts_a_failure_when_the_result_says_failed(self, tmp_path, isolate, monkeypatch):
@@ -108,7 +110,7 @@ class TestCollectResults:
         (tmp_path / "s1.json").write_text(json.dumps({"status": "failed", "output": "boom"}))
 
         await worker.collect_results("http://api", "tok")
-        assert isolate["posted"][0][1] == {"success": False, "output": "boom"}
+        assert isolate["posted"][0][1] == {"success": False, "output": "boom", "run_token": "tok-1"}
 
     async def test_consumes_the_result_file(self, tmp_path, isolate, monkeypatch):
         alive(monkeypatch)
@@ -184,3 +186,38 @@ class TestCollectResults:
 
         await worker.collect_results("http://api", "tok")
         assert isolate["posted"] == []
+
+
+class TestRunToken:
+    """The token identifies which execution a result belongs to."""
+
+    async def test_echoes_the_token_it_was_dispatched_with(self, tmp_path, isolate, monkeypatch):
+        alive(monkeypatch)
+        dispatch(tmp_path, run_token="abc123")
+        (tmp_path / "s1.json").write_text(json.dumps({"status": "passed", "output": "ok"}))
+
+        await worker.collect_results("http://api", "tok")
+        assert isolate["posted"][0][1]["run_token"] == "abc123"
+
+    async def test_sends_null_when_the_backend_supplied_none(self, tmp_path, isolate, monkeypatch):
+        alive(monkeypatch)
+        dispatch(tmp_path, run_token=None)
+        (tmp_path / "s1.json").write_text(json.dumps({"status": "passed"}))
+
+        await worker.collect_results("http://api", "tok")
+        assert isolate["posted"][0][1]["run_token"] is None
+
+    async def test_stops_tracking_the_token_once_reported(self, tmp_path, isolate, monkeypatch):
+        alive(monkeypatch)
+        dispatch(tmp_path)
+        (tmp_path / "s1.json").write_text(json.dumps({"status": "passed"}))
+
+        await worker.collect_results("http://api", "tok")
+        assert "s1" not in worker._run_tokens
+
+    async def test_a_timeout_still_reports_its_token(self, tmp_path, isolate, monkeypatch):
+        alive(monkeypatch)
+        dispatch(tmp_path, age=worker.STEP_TOTAL_TIMEOUT + 1, run_token="xyz")
+
+        await worker.collect_results("http://api", "tok")
+        assert isolate["posted"][0][1]["run_token"] == "xyz"

@@ -259,6 +259,9 @@ def _results_dir(working_dir: str | None, task_id: str) -> str:
 _sessions: dict[str, dict] = {}
 # step_id -> (task_id, monotonic dispatch time) — steps awaiting a result file
 _dispatched: dict[str, tuple[str, float]] = {}
+# step_id -> run_token, echoed back so the backend can drop a result belonging
+# to an execution that has since been stopped and restarted.
+_run_tokens: dict[str, str | None] = {}
 
 
 def _dispatch_marker(task_id: str, stage_idx: int) -> str:
@@ -469,7 +472,11 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
         for step in steps:
             await _api_post_async(
                 f"{api_base}/api/tasks/{task_id}/steps/{step['step_id']}/complete",
-                token, {"success": False, "output": "Failed to start claude session"},
+                token, {
+                    "success": False,
+                    "output": "Failed to start claude session",
+                    "run_token": step.get("run_token"),
+                },
             )
         return
 
@@ -484,6 +491,7 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
         now = time.monotonic()
         for step in steps:
             _dispatched[step["step_id"]] = (task_id, now)
+            _run_tokens[step["step_id"]] = step.get("run_token")
         log.info("Stage %d of task %s already dispatched; adopting in-flight steps", stage_idx, task_id[:8])
         return
 
@@ -507,6 +515,7 @@ async def dispatch_stage(api_base: str, token: str, task_id: str, stage_idx: int
     now = time.monotonic()
     for step in steps:
         _dispatched[step["step_id"]] = (task_id, now)
+        _run_tokens[step["step_id"]] = step.get("run_token")
         await broadcast_status({
             "type": "step_started",
             "task_id": task_id,
@@ -595,10 +604,11 @@ async def collect_results(api_base: str, token: str) -> None:
             continue
 
         _dispatched.pop(step_id, None)
+        run_token = _run_tokens.pop(step_id, None)
         state["last_active"] = now
         await _api_post_async(
             f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
-            token, {"success": success, "output": output},
+            token, {"success": success, "output": output, "run_token": run_token},
         )
         await broadcast_status({
             "type": "step_completed",
@@ -627,7 +637,11 @@ async def process_reply(api_base: str, token: str, reply: dict) -> None:
     if not state:
         await _api_post_async(
             f"{api_base}/api/tasks/{task_id}/steps/{step_id}/complete",
-            token, {"success": False, "output": "No live session to resume"},
+            token, {
+                "success": False,
+                "output": "No live session to resume",
+                "run_token": _run_tokens.get(step_id),
+            },
         )
         return
     log.info("Injecting reply into %s: %s", state["name"], message[:60])
