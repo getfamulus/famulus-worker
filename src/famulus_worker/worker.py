@@ -7,8 +7,8 @@ and relays a live terminal to the browser. No inbound ports required — all
 connections are outbound to the backend.
 
 Usage:
-    python worker.py --token <TOKEN>
-    python worker.py --token <TOKEN> --api http://192.168.0.2:8006
+    famulus-worker --worker-token <TOKEN>
+    famulus-worker --worker-token <TOKEN> --api https://famulus.example.com
 """
 
 import argparse
