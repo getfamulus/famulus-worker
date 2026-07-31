@@ -2,6 +2,19 @@
 
 Notable changes to `famulus-worker`.
 
+## v0.1.2 - 2026-07-31
+
+### Fixed
+
+- **A result is now tied to the execution that produced it.** Each dispatched
+  step carries a `run_token` from the backend, echoed back with the result. If a
+  step is stopped and restarted, a late result from the previous run is dropped
+  instead of being applied to the new one — the backend's status check could not
+  tell those apart, because a restarted step is `running` again.
+
+  Requires a backend on v0.2.4 or later. Against an older backend the token is
+  simply ignored, so this release is safe to install either way.
+
 ## v0.1.1 - 2026-07-31
 
 ### Security

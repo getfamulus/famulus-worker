@@ -1,6 +1,6 @@
 [project]
 name = "famulus-worker"
-version = "0.1.1"
+version = "0.1.2"
 description = "Runs Claude Code sessions in tmux on your machine and streams them to a Famulus backend"
 readme = "README.md"
 requires-python = ">=3.12"
