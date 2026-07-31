@@ -2,6 +2,24 @@
 
 Notable changes to `famulus-worker`.
 
+## v0.1.1 - 2026-07-31
+
+### Security
+
+- **Fixed a path traversal in attachment downloads.** The containment check
+  compared the target against a directory built from the untrusted path, so once
+  that directory had itself escaped, the check passed. An attachment path of the
+  form `attachments/../../x.txt` wrote outside the cache directory, anywhere the
+  worker's user could write. Attachment metadata can originate from an imported
+  ticket, which the trust model treats as untrusted. Containment is now checked
+  against the cache root, and the file id is rejected if it is `.` or `..`.
+
+### Added
+
+- A test suite — 54 tests covering attachment path containment, the stage prompt
+  builder, result collection, the blocked-session detector and dispatch markers.
+  CI runs them on Python 3.12 and 3.13.
+
 ## v0.1.0 - 2026-07-30
 
 First public release, extracted from the Famulus monorepo and packaged as an

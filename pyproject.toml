@@ -1,6 +1,6 @@
 [project]
 name = "famulus-worker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Runs Claude Code sessions in tmux on your machine and streams them to a Famulus backend"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,6 +18,12 @@ dependencies = [
     "websockets>=13",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
 [project.urls]
 Homepage = "https://github.com/getfamulus/famulus"
 Repository = "https://github.com/getfamulus/famulus-worker"
@@ -32,3 +38,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/famulus_worker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"

@@ -13,6 +13,20 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run the tests
+        run: uv run --python ${{ matrix.python }} --extra dev pytest
+
   build:
     runs-on: ubuntu-latest
     steps:

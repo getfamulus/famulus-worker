@@ -143,11 +143,19 @@ def _download_attachment(api_base: str, token: str, att: dict) -> str | None:
     if not filename or filename in {".", ".."}:
         log.error("Rejected attachment with unsafe filename: %r", raw_filename)
         return None
-    local_dir = os.path.join(ATTACHMENTS_CACHE, os.path.basename(file_id))
+    # basename("..") is still "..", so the id needs the same check as the
+    # filename — otherwise it walks the cache directory upwards.
+    file_id = os.path.basename(file_id)
+    if not file_id or file_id in {".", ".."}:
+        log.error("Rejected attachment with unsafe id: %r", m.group(1))
+        return None
+    # Containment is checked against the cache root, never against a directory
+    # derived from the untrusted path, which may itself have escaped.
+    cache_root = os.path.realpath(ATTACHMENTS_CACHE)
+    local_dir = os.path.join(cache_root, file_id)
     local_path = os.path.join(local_dir, filename)
-    real_dir = os.path.realpath(local_dir)
-    if not os.path.realpath(local_path).startswith(real_dir + os.sep):
-        log.error("Rejected attachment escaping cache dir: %r", raw_filename)
+    if not os.path.realpath(local_path).startswith(cache_root + os.sep):
+        log.error("Rejected attachment escaping cache dir: %r", path)
         return None
     if os.path.isfile(local_path):
         return local_path
